@@ -1,11 +1,10 @@
 /**
- * server.js — Mia Backend v4 (nomes de ferramentas corrigidos)
- * Ferramentas espelham exatamente o api-mcp do Supabase.
+ * server.js — Mia Backend v5 (Lovable AI Gateway)
+ * Migrado de Anthropic → Lovable AI (Gemini 2.5 Flash) pra resolver rate limit de tokens.
  */
 
 const express = require("express");
 const cors    = require("cors");
-const Anthropic = require("@anthropic-ai/sdk").default;
 const redis   = require("redis");
 const { v4: uuid } = require("uuid");
 
@@ -14,16 +13,20 @@ const { v4: uuid } = require("uuid");
 const app  = express();
 const PORT = process.env.PORT || 3001;
 
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Lovable AI Gateway (formato OpenAI-compatível)
+const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
+const LOVABLE_AI_URL  = "https://ai.gateway.lovable.dev/v1/chat/completions";
+const MODEL           = process.env.MIA_MODEL || "google/gemini-2.5-flash";
+// Alternativas: "openai/gpt-5-mini" (mais caro, melhor tool-use), "google/gemini-3-flash-preview"
 
 // Supabase MCP
 const API_MCP_TOKEN = process.env.API_MCP_TOKEN;
 const API_MCP_URL   = "https://bsmjvixagmmmoffpbtuw.supabase.co/functions/v1/api-mcp";
 
-// Valida variáveis críticas no boot
-console.log("🔧 ANTHROPIC_API_KEY:", process.env.ANTHROPIC_API_KEY ? "✅ OK" : "❌ MISSING");
-console.log("🔧 API_MCP_TOKEN:    ", API_MCP_TOKEN ? "✅ OK" : "❌ MISSING");
-console.log("🔧 REDIS_URL:        ", process.env.REDIS_URL ? "✅ OK" : "⚠️  usando localhost");
+console.log("🔧 LOVABLE_API_KEY:", LOVABLE_API_KEY ? "✅ OK" : "❌ MISSING");
+console.log("🔧 API_MCP_TOKEN:  ", API_MCP_TOKEN ? "✅ OK" : "❌ MISSING");
+console.log("🔧 MODEL:          ", MODEL);
+console.log("🔧 REDIS_URL:      ", process.env.REDIS_URL ? "✅ OK" : "⚠️  localhost");
 
 app.use(cors({ origin: "*" }));
 app.use(express.json());
@@ -42,18 +45,14 @@ async function getHistory(sessionId) {
 
 async function saveHistory(sessionId, messages) {
   try {
-    // 2h em vez de 8h — evita arrastar contexto stale (datas antigas etc)
-    await redisClient.setEx(`mia:${sessionId}`, 7200, JSON.stringify(messages.slice(-40)));
+    // Mantém só as últimas 30 msgs pra evitar contexto inflado
+    await redisClient.setEx(`mia:${sessionId}`, 7200, JSON.stringify(messages.slice(-30)));
   } catch { /* ignora */ }
 }
 
-// ─── Chamador MCP (JSON-RPC → api-mcp do Supabase) ───────────────────────────
+// ─── MCP caller (igual antes) ─────────────────────────────────────────────────
 
-/**
- * Extrai texto de uma resposta MCP (JSON ou SSE).
- */
 function parseMcpResponse(rawText) {
-  // Resposta SSE: linhas "data: {...}"
   if (rawText.includes("data:")) {
     const results = [];
     for (const line of rawText.split("\n")) {
@@ -66,12 +65,10 @@ function parseMcpResponse(rawText) {
         } else if (json.result) {
           results.push(JSON.stringify(json.result, null, 2));
         }
-      } catch { /* ignora linhas mal formadas */ }
+      } catch { /* ignora */ }
     }
     if (results.length) return results.join("\n");
   }
-
-  // Resposta JSON pura
   let json;
   try { json = JSON.parse(rawText); } catch { return rawText; }
   if (json.error) throw new Error(`api-mcp error: ${json.error.message}`);
@@ -84,232 +81,168 @@ function parseMcpResponse(rawText) {
 
 async function callMcpTool(toolName, args) {
   if (!API_MCP_TOKEN) {
-    const msg = "API_MCP_TOKEN não configurado no Railway. Adicione a variável de ambiente.";
-    console.error("❌", msg);
-    return msg;
+    return "API_MCP_TOKEN não configurado no Railway.";
   }
 
-  // Headers padrão MCP Streamable HTTP
   const headers = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
     "Authorization": `Bearer ${API_MCP_TOKEN}`,
   };
 
-  // ── Passo 1: initialize (handshake obrigatório do protocolo MCP) ──────────
+  // Handshake
   try {
     const initRes = await fetch(API_MCP_URL, {
-      method: "POST",
-      headers,
+      method: "POST", headers,
       body: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "initialize",
+        jsonrpc: "2.0", method: "initialize",
         params: {
           protocolVersion: "2024-11-05",
           capabilities: { roots: { listChanged: false } },
-          clientInfo: { name: "mia-backend", version: "4.0.0" },
+          clientInfo: { name: "mia-backend", version: "5.0.0" },
         },
         id: 0,
       }),
     });
-
-    // Se o servidor mantém sessão stateful, captura o ID
     const sessionId = initRes.headers.get("Mcp-Session-Id");
-    if (sessionId) {
-      headers["Mcp-Session-Id"] = sessionId;
-      console.log(`🔧 [MCP] Session-Id: ${sessionId}`);
-    }
-
-    console.log(`🔧 [MCP] Initialize → ${initRes.status}`);
+    if (sessionId) headers["Mcp-Session-Id"] = sessionId;
   } catch (e) {
-    console.warn(`⚠️ [MCP] Initialize falhou (${e.message}), tentando tool call direto`);
+    console.warn(`⚠️ [MCP] Initialize falhou: ${e.message}`);
   }
 
-  // ── Passo 2: tools/call ───────────────────────────────────────────────────
-  console.log(`🔧 [MCP] Chamando tool: ${toolName}`, JSON.stringify(args));
-
+  console.log(`🔧 [MCP] ${toolName}`, JSON.stringify(args));
   const res = await fetch(API_MCP_URL, {
-    method: "POST",
-    headers,
+    method: "POST", headers,
     body: JSON.stringify({
-      jsonrpc: "2.0",
-      method: "tools/call",
+      jsonrpc: "2.0", method: "tools/call",
       params: { name: toolName, arguments: args },
       id: Date.now(),
     }),
   });
 
   const rawText = await res.text();
-  console.log(`🔧 [MCP] ${toolName} → Status: ${res.status}`);
-  console.log(`🔧 [MCP] Raw: ${rawText.slice(0, 600)}`);
-
-  if (!res.ok) {
-    throw new Error(`api-mcp HTTP ${res.status}: ${rawText}`);
-  }
-
+  console.log(`🔧 [MCP] ${toolName} → ${res.status}`);
+  if (!res.ok) throw new Error(`api-mcp HTTP ${res.status}: ${rawText.slice(0, 300)}`);
   return parseMcpResponse(rawText);
 }
 
-// ─── Definições de ferramentas (nomes EXATOS do api-mcp) ─────────────────────
+// ─── Tools — convertidas para formato OpenAI ──────────────────────────────────
+// Antes: { name, description, input_schema } (Anthropic)
+// Agora: { type: "function", function: { name, description, parameters } } (OpenAI)
 
-const TOOLS = [
-  // ── ERP MK ──
+const TOOL_DEFS = [
   {
     name: "erp_buscar_cliente",
-    description: "Busca cliente no ERP MK por CPF/CNPJ ou código interno. Retorna dados cadastrais, conexões, contratos e saldo.",
-    input_schema: {
+    description: "Busca cliente no ERP MK por CPF/CNPJ ou código interno.",
+    parameters: {
       type: "object",
       properties: {
         cpf_cnpj:   { type: "string", description: "CPF ou CNPJ (apenas dígitos)" },
         cd_cliente: { type: "string", description: "Código do cliente no MK" },
       },
-      required: [],
-    },
-  },
-  {
-    name: "erp_faturas_cliente",
-    description: "Consulta faturas (em aberto / vencidas) de um cliente no ERP MK.",
-    input_schema: {
-      type: "object",
-      properties: {
-        cd_cliente: { type: "string", description: "Código do cliente no MK" },
-      },
-      required: ["cd_cliente"],
     },
   },
   {
     name: "erp_os_em_atraso",
-    description: "Lista as ordens de serviço em atraso a partir de uma data de abertura.",
-    input_schema: {
+    description: "Lista OS em atraso. Se data_abertura omitida ou 'hoje', usa data atual de São Paulo.",
+    parameters: {
       type: "object",
       properties: {
-        data_abertura: { type: "string", description: "Data no formato dd/MM/yyyy" },
+        data_abertura: { type: "string", description: "dd/MM/yyyy ou 'hoje'" },
       },
-      required: ["data_abertura"],
-    },
-  },
-
-  // ── Plataforma Megalink ──
-  {
-    name: "plataforma_listar_colaboradores",
-    description: "Lista colaboradores cadastrados na plataforma Megalink. Pode filtrar por equipe.",
-    input_schema: {
-      type: "object",
-      properties: {
-        team: { type: "string", description: "Nome da equipe (parcial)" },
-      },
-      required: [],
-    },
-  },
-  {
-    name: "plataforma_auditorias_recentes",
-    description: "Lista auditorias técnicas recentes (status, equipe, responsável, comentário do auditor).",
-    input_schema: {
-      type: "object",
-      properties: {
-        limit:  { type: "number", description: "Número máximo de registros" },
-        status: { type: "string", description: "Filtrar por status: em_andamento ou finalizada" },
-      },
-      required: [],
     },
   },
   {
     name: "plataforma_reincidencias",
-    description: "Lista reincidências cadastradas (cliente, chamados vinculados, valor economizado).",
-    input_schema: {
+    description: "Lista reincidências dos últimos N dias (default 30) com cliente, chamados e valor economizado.",
+    parameters: {
       type: "object",
       properties: {
-        cliente: { type: "string", description: "Nome do cliente para filtrar" },
-        limit:   { type: "number", description: "Número máximo de registros" },
+        dias: { type: "number", description: "Últimos N dias (default 30)" },
       },
-      required: [],
     },
   },
   {
-    name: "plataforma_avaliacoes_colaborador",
-    description: "Retorna últimas avaliações de um colaborador (histórico de notas, status, área).",
-    input_schema: {
+    name: "listar_reincidencias_recentes",
+    description: "Lista reincidências dos últimos N dias (default 7).",
+    parameters: {
       type: "object",
       properties: {
-        collaborator: { type: "string", description: "Nome do colaborador" },
-        limit:        { type: "number", description: "Máximo de registros (padrão 10)" },
+        dias: { type: "number", description: "Últimos N dias (default 7)" },
       },
-      required: ["collaborator"],
+    },
+  },
+  {
+    name: "listar_cs_tickets_pendentes",
+    description: "Tickets de Customer Success ainda sem resposta da IA.",
+    parameters: {
+      type: "object",
+      properties: { limit: { type: "number", description: "Máximo (default 20)" } },
+    },
+  },
+  {
+    name: "listar_auditorias_recentes",
+    description: "Auditorias concluídas nos últimos N dias.",
+    parameters: {
+      type: "object",
+      properties: { dias: { type: "number", description: "Últimos N dias (default 7)" } },
     },
   },
   {
     name: "plataforma_query",
-    description: "Consulta SELECT em tabelas internas da plataforma. Use para buscar tickets CS, leads, requisições de compra, agendamentos e mais.",
-    input_schema: {
+    description: "Query genérico de leitura. Tabelas permitidas: recurrences, cs_tickets, audits, evaluations, schedule_slots, service_schedules, vehicle_inspections, system_events.",
+    parameters: {
       type: "object",
       properties: {
-        table: {
-          type: "string",
-          description: "Tabela a consultar",
-          enum: [
-            "collaborators",
-            "evaluations",
-            "audits",
-            "recurrences",
-            "leads",
-            "vehicle_inspections",
-            "survey_responses",
-            "cs_tickets",
-            "purchase_requests",
-            "schedule_slots",
-            "service_schedules",
-            "technician_regions",
-            "tech_metrics_cache",
-          ],
-        },
-        filter_column: { type: "string", description: "Coluna para filtrar (opcional)" },
-        filter_value:  { type: "string", description: "Valor do filtro (opcional)" },
-        limit:         { type: "number", description: "Número máximo de registros (padrão 20)" },
+        tabela:  { type: "string", description: "Nome da tabela (whitelist)" },
+        dias:    { type: "number", description: "Últimos N dias (default 30)" },
+        limit:   { type: "number", description: "Máximo (default 50, max 200)" },
+        filtros: { type: "object", description: "Filtros eq simples: { coluna: valor }" },
       },
-      required: ["table"],
-    },
-  },
-
-  // ── Comunicação ──
-  {
-    name: "slack_enviar_mensagem",
-    description: "Envia uma mensagem para um canal Slack da Megalink.",
-    input_schema: {
-      type: "object",
-      properties: {
-        channel: { type: "string", description: "ID do canal Slack (ex: C0123456) ou nome (ex: #operacoes)" },
-        text:    { type: "string", description: "Texto da mensagem (suporta mrkdwn)" },
-      },
-      required: ["channel", "text"],
+      required: ["tabela"],
     },
   },
   {
-    name: "whatsapp_enviar_zenvia",
-    description: "Envia mensagem WhatsApp via Zenvia para um cliente ou colaborador.",
-    input_schema: {
+    name: "listar_eventos_nao_processados",
+    description: "Eventos do sistema ainda não processados pela IA.",
+    parameters: {
       type: "object",
-      properties: {
-        to:   { type: "string", description: "Telefone destino no formato 55DDDNNNNNNNNN" },
-        text: { type: "string", description: "Texto da mensagem" },
-      },
-      required: ["to", "text"],
+      properties: { limit: { type: "number", description: "Máximo (default 30)" } },
     },
   },
   {
-    name: "whatsapp_historico_conversa",
-    description: "Retorna as últimas mensagens de WhatsApp (Zenvia) trocadas com um número.",
-    input_schema: {
+    name: "publicar_evento",
+    description: "Publica novo evento em system_events.",
+    parameters: {
       type: "object",
       properties: {
-        phone: { type: "string", description: "Número no formato 55DDDNNNNNNNNN" },
-        limit: { type: "number", description: "Número de mensagens a retornar" },
+        source:      { type: "string" },
+        event_type:  { type: "string" },
+        payload:     { type: "object" },
+        severity:    { type: "string", enum: ["info", "warning", "critical"] },
+        entity_type: { type: "string" },
+        entity_id:   { type: "string" },
       },
-      required: ["phone"],
+      required: ["source", "event_type"],
+    },
+  },
+  {
+    name: "marcar_eventos_processados",
+    description: "Marca eventos como processados pela IA.",
+    parameters: {
+      type: "object",
+      properties: {
+        event_ids: { type: "array", items: { type: "string" } },
+      },
+      required: ["event_ids"],
     },
   },
 ];
 
-// ─── Helpers de data BR ────────────────────────────────────────────────────────
+// Wrap pro formato OpenAI
+const TOOLS = TOOL_DEFS.map((t) => ({ type: "function", function: t }));
+
+// ─── Helpers de data BR ───────────────────────────────────────────────────────
 
 function todayBR() {
   return new Intl.DateTimeFormat("pt-BR", {
@@ -318,7 +251,6 @@ function todayBR() {
   }).format(new Date());
 }
 
-// Sanitiza datas alucinadas em frases tipo "hoje 09/07/2025" → "hoje 23/04/2026"
 function sanitizeDates(text) {
   if (!text) return text;
   const today = todayBR();
@@ -328,35 +260,61 @@ function sanitizeDates(text) {
   );
 }
 
-// ─── System prompt (gerado dinâmico p/ injetar a data correta) ────────────────
-
 function buildSystemPrompt() {
   const hoje = todayBR();
-  return `Você é a Mia, assistente inteligente da Megalink OPS — o sistema operacional interno da Megalink Telecom.
+  return `Você é a Mia, assistente inteligente da Megalink OPS — sistema operacional interno da Megalink Telecom.
 
 ⚠️ CONTEXTO TEMPORAL CRÍTICO:
 - HOJE é ${hoje} (fuso America/Sao_Paulo).
 - NUNCA use outra data como "hoje". Ignore datas que apareçam em exemplos do seu treinamento.
 - Se uma ferramenta retornar campos como "hoje_brasil", "data_abertura_usada" ou "instrucao_para_o_modelo", esses valores são a verdade absoluta — use-os literalmente.
 
-Você tem acesso direto aos dados reais da empresa via ferramentas integradas ao backend da plataforma.
-
-## Ferramentas disponíveis
-- **ERP MK:** buscar clientes, consultar faturas em aberto/vencidas, listar OS em atraso
-- **Plataforma:** listar colaboradores, auditorias recentes, reincidências, avaliações individuais, query livre em tabelas internas (tickets CS, leads, agendamentos, requisições de compra, inspeções de veículo e mais)
-- **Slack:** enviar mensagens e alertas para canais internos
-- **WhatsApp (Zenvia):** enviar mensagens e consultar histórico de conversas com clientes
+## Ferramentas
+- **ERP MK:** erp_buscar_cliente, erp_os_em_atraso
+- **Plataforma:** plataforma_reincidencias, listar_reincidencias_recentes, listar_cs_tickets_pendentes, listar_auditorias_recentes, plataforma_query (whitelist de tabelas)
+- **Eventos:** listar_eventos_nao_processados, publicar_evento, marcar_eventos_processados
 
 ## Regras
-1. Use sempre as ferramentas antes de responder sobre dados internos — nunca invente números, nomes ou datas.
-2. Para datas em ferramentas do ERP, use o formato dd/MM/yyyy. Quando o usuário disser "hoje", use ${hoje}.
-3. Para tickets CS, use a ferramenta \`plataforma_query\` com \`table: "cs_tickets"\`.
-4. Ao enviar mensagens no Slack ou WhatsApp, confirme o conteúdo com o usuário antes de enviar — exceto se ele pedir para enviar direto.
-5. Responda sempre em português brasileiro. Use markdown quando ajudar na leitura.
-6. Seja direto e objetivo — você é um coworker, não um assistente genérico.`;
+1. Sempre use ferramentas antes de responder sobre dados internos — nunca invente.
+2. Para datas em ferramentas do ERP, use dd/MM/yyyy. Quando o usuário disser "hoje", use ${hoje}.
+3. Para tickets CS use plataforma_query com tabela "cs_tickets" (ou listar_cs_tickets_pendentes).
+4. Responda em português brasileiro. Markdown quando ajudar na leitura.
+5. Seja direto e objetivo — você é coworker, não assistente genérico.`;
 }
 
-// ─── Rota principal: chat com streaming SSE ────────────────────────────────────
+// ─── Chamada ao Lovable AI Gateway (com tool-use loop) ────────────────────────
+
+async function callLovableAI(messages) {
+  const body = {
+    model: MODEL,
+    messages: [
+      { role: "system", content: buildSystemPrompt() },
+      ...messages,
+    ],
+    tools: TOOLS,
+    tool_choice: "auto",
+  };
+
+  const res = await fetch(LOVABLE_AI_URL, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${LOVABLE_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text();
+    if (res.status === 429) throw new Error("Rate limit do Lovable AI. Aguarde alguns segundos.");
+    if (res.status === 402) throw new Error("Créditos do Lovable AI esgotados. Adicione no workspace.");
+    throw new Error(`Lovable AI HTTP ${res.status}: ${errText.slice(0, 300)}`);
+  }
+
+  return res.json();
+}
+
+// ─── Rota principal: chat com SSE ─────────────────────────────────────────────
 
 app.post("/api/agent/chat", async (req, res) => {
   const { message, sessionId: clientSessionId } = req.body;
@@ -381,94 +339,95 @@ app.post("/api/agent/chat", async (req, res) => {
     while (iteracoes < 10) {
       iteracoes++;
 
-      const response = await anthropic.messages.create({
-        model:      "claude-sonnet-4-6",
-        max_tokens: 8096,
-        system:     buildSystemPrompt(), // ← gera com a data de HOJE a cada chamada
-        tools:      TOOLS,
-        messages,
-      });
+      const response = await callLovableAI(messages);
+      const choice = response.choices?.[0];
+      if (!choice) throw new Error("Resposta vazia do Lovable AI");
 
-      const toolUses = [];
+      const msg = choice.message;
+      const finishReason = choice.finish_reason;
 
-      for (const block of response.content) {
-        if (block.type === "text" && block.text) {
-          send({ type: "text", content: sanitizeDates(block.text) }); // ← sanitiza datas alucinadas
-        } else if (block.type === "tool_use") {
-          toolUses.push(block);
-        }
+      // Texto da resposta
+      if (msg.content) {
+        send({ type: "text", content: sanitizeDates(msg.content) });
       }
 
-      if (response.stop_reason === "end_turn" || toolUses.length === 0) break;
+      // Tool calls (formato OpenAI: array com {id, function:{name, arguments}})
+      const toolCalls = msg.tool_calls || [];
 
-      messages.push({ role: "assistant", content: response.content });
+      if (finishReason === "stop" || toolCalls.length === 0) {
+        // Salva mensagem final do assistente
+        if (msg.content) messages.push({ role: "assistant", content: msg.content });
+        break;
+      }
 
+      // Adiciona mensagem do assistente com tool_calls
+      messages.push({
+        role: "assistant",
+        content: msg.content || "",
+        tool_calls: toolCalls,
+      });
+
+      // Executa todas as tools em paralelo
       const toolResults = await Promise.all(
-        toolUses.map(async (tool) => {
-          send({ type: "tool_start", tool: tool.name });
+        toolCalls.map(async (call) => {
+          const name = call.function.name;
+          let args = {};
+          try { args = JSON.parse(call.function.arguments || "{}"); } catch { /* ignora */ }
+
+          send({ type: "tool_start", tool: name });
+
           let result;
           try {
-            result = await callMcpTool(tool.name, tool.input);
+            result = await callMcpTool(name, args);
           } catch (e) {
-            result = `Erro ao chamar ${tool.name}: ${e.message}`;
+            result = `Erro ao chamar ${name}: ${e.message}`;
           }
-          send({ type: "tool_result", tool: tool.name });
-          return { type: "tool_result", tool_use_id: tool.id, content: result };
+
+          send({ type: "tool_result", tool: name });
+
+          return {
+            role: "tool",
+            tool_call_id: call.id,
+            content: typeof result === "string" ? result : JSON.stringify(result),
+          };
         })
       );
 
-      messages.push({ role: "user", content: toolResults });
+      messages.push(...toolResults);
     }
 
     await saveHistory(sessionId, messages);
     send({ type: "done" });
   } catch (e) {
+    console.error("❌ chat error:", e.message);
     send({ type: "error", error: e.message });
   } finally {
     res.end();
   }
 });
 
-// ─── Rota de diagnóstico ──────────────────────────────────────────────────────
+// ─── Diagnóstico ──────────────────────────────────────────────────────────────
 
-app.get("/api/debug/tools", async (req, res) => {
-  if (!API_MCP_TOKEN) return res.status(500).json({ error: "API_MCP_TOKEN não configurado" });
-
-  const headers = {
-    "Content-Type": "application/json",
-    "Accept": "application/json, text/event-stream",
-    "Authorization": `Bearer ${API_MCP_TOKEN}`,
-  };
-
-  const results = {};
-
-  // 1) Testa initialize
+app.get("/api/debug/ai", async (_req, res) => {
+  if (!LOVABLE_API_KEY) return res.status(500).json({ error: "LOVABLE_API_KEY não configurada" });
   try {
-    const r = await fetch(API_MCP_URL, {
-      method: "POST", headers,
-      body: JSON.stringify({ jsonrpc: "2.0", method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "debug", version: "1" } }, id: 0 }),
+    const r = await fetch(LOVABLE_AI_URL, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${LOVABLE_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [{ role: "user", content: "ping" }],
+      }),
     });
-    const sessionId = r.headers.get("Mcp-Session-Id");
-    if (sessionId) headers["Mcp-Session-Id"] = sessionId;
-    results.initialize = { status: r.status, sessionId, body: await r.text() };
-  } catch (e) { results.initialize = { error: e.message }; }
-
-  // 2) Testa tools/list
-  try {
-    const r = await fetch(API_MCP_URL, {
-      method: "POST", headers,
-      body: JSON.stringify({ jsonrpc: "2.0", method: "tools/list", params: {}, id: 1 }),
-    });
-    results.toolsList = { status: r.status, body: await r.text() };
-  } catch (e) { results.toolsList = { error: e.message }; }
-
-  res.json(results);
+    res.json({ status: r.status, body: await r.text() });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Rotas auxiliares ──────────────────────────────────────────────────────────
-
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", agent: "Mia", version: "4.0.0", mcp: API_MCP_URL });
+  res.json({ status: "ok", agent: "Mia", version: "5.0.0", model: MODEL });
 });
 
 app.delete("/api/agent/session/:id", async (req, res) => {
@@ -476,6 +435,4 @@ app.delete("/api/agent/session/:id", async (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── Start ─────────────────────────────────────────────────────────────────────
-
-app.listen(PORT, () => console.log(`✅ Mia v4 rodando na porta ${PORT} → api-mcp conectado`));
+app.listen(PORT, () => console.log(`✅ Mia v5 (Lovable AI) na porta ${PORT}`));
